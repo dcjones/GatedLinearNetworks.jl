@@ -1,14 +1,50 @@
 module GatedLinearNetworks
 
 using Flux
+using Statistics
 
 
-# TODO: implemnent online mean std estimation
-# I think the idea is that we standardize input is it comes to us, then
-# feed that into the context functions.
 
-# Do we also standardize the input to the neurons? I don't think there is any
-# nead to.
+"""
+Normalize input using a online estimate of mean and variance using Welford's
+algorithm.
+"""
+struct NormalizationLayer{VF <: AbstractVector{<:Real}, VI <: AbstractVector{Int}}
+    count::VI # [1]
+    mean::VF # [data_dim]
+    m2::VF # [data_dim]
+end
+
+
+function NormalizationLayer(n::Int)
+    return NormalizationLayer(
+        Int[0],
+        zeros(Float32, n),
+        zeros(Float32, n))
+end
+
+
+"""
+x is [data_dim, batch_dim]
+"""
+function apply(layer::NormalizationLayer, x::AbstractMatrix)
+    for j in 1:size(x, 2)
+        layer.count .+= 1
+        xj = x[:,j]
+        delta = xj - layer.mean
+        layer.mean .+= delta ./ layer.count
+        delta2 = xj - layer.mean
+        layer.m2 .+= delta .* delta2
+    end
+
+    @assert layer.count[1] > 0
+
+    @show layer.m2
+    @show layer.count
+
+    sd = sqrt.(layer.m2 ./ layer.count)
+    return (x .- layer.mean) ./ sd
+end
 
 
 # TODO: implement simplistic online gaussian linear regression.
@@ -28,7 +64,6 @@ end
 #         {M<:AbstractMatrix{<:Real}}
 
 # end
-
 
 
 # TODO: Each layer should be it's own type to allow for different numbers of
@@ -158,6 +193,8 @@ function apply(
     if training
         dloss_dweights = gradient(loss, weights)[1]
         layer.weights[:,cs] = weights - layer.learning_rate * dloss_dweights
+        # TODO: paper says we have to project here to keep weights within
+        # a valid range. Their code doesn't seem to though.
     end
 
     return predict(weights)
