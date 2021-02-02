@@ -46,6 +46,12 @@ function forward(layer::NormalizationLayer, x::AbstractMatrix, training::Bool)
 end
 
 
+function inverse(layer::NormalizationLayer, z::AbstractMatrix)
+    sd = sqrt.(layer.m2 ./ layer.count)
+    return (z .* sd) .+ layer.mean
+end
+
+
 # TODO: implement simplistic online gaussian linear regression.
 
 # What's the idea here? We need to produce multiple regression models? Each
@@ -62,6 +68,7 @@ struct BasicGaussianLinearRegression{
     # accumulated sufficient statistics
     xy::VF # [prediction_dim]
     xx::VF # [1]
+    x::VF # [prediction_dim]
     y::VF # [prediction_dim]
     count::VI # [1]
 
@@ -76,33 +83,50 @@ function BasicGaussianLinearRegression(i::Int, prediction_dim::Int)
         i,
         zeros(Float32, prediction_dim),
         zeros(Float32, 1),
+        zeros(Float32, 1),
         zeros(Float32, prediction_dim),
         zeros(Int, 1),
         fill(1f0, prediction_dim),
         fill(1f0, prediction_dim))
 end
 
+# TODO: Ok, can I batch this?
 
 function forward(
         layer::BasicGaussianLinearRegression,
         x::AbstractMatrix, y::AbstractMatrix, training::Bool)
 
-    τ_w = layer.τ0 .+ layer.τ .* layer.xx
-    μ_w = layer.τ .* inv.(τ_w) .* layer.xy
-
-    τ_b = layer.τ0 .+ layer.τ .* layer.count
-    μ_b = layer.τ .* inv.(τ_b) .* layer.y
-
     xi = x[layer.i,:]
 
+    c = (layer.τ0 .+ layer.τ .* layer.count) .*
+        (layer.τ0 .+ layer.τ .* layer.xx) .- (layer.τ .* layer.x).^2
+
+    v = layer.τ .* layer.x .* layer.y
+
+    μ_w = (layer.τ ./ c) .*
+        ((layer.τ0 .+ layer.τ .* layer.count) .* layer.xy .-
+        layer.τ .* layer.x .* layer.y)
+
+
+    μ_b = (layer.τ ./ c) .*
+        ((layer.τ0 .+ layer.τ .* layer.xx) .* layer.y .-
+        layer.τ .* layer.x .* layer.xy)
+
+    σ2 = inv.(layer.τ) .+ inv.(c) .* (
+        (layer.τ0 .+ layer.τ .* layer.count) .* xi.^2 .-
+        layer.τ .* xi .* layer.x .+
+        layer.τ0 .+
+        layer.τ .* layer.xx .-
+        layer.τ .* xi .* layer.x)
+
     μ = xi .* μ_w .+ μ_b
-    σ = inv.(layer.τ) .+ inv.(τ_b) .+ xi.^2 .* inv.(τ_w)
 
     if training
         for j in 1:size(x, 2)
             xij = x[layer.i,j]
             yj = y[:,j]
 
+            layer.x .+= xij
             layer.xx .+= xij^2
             layer.xy .+= xij*yj
             layer.y .+= yj
@@ -111,13 +135,8 @@ function forward(
     end
 
     # [predicton_dim, batch_dim]
-    return μ, σ.^2
+    return μ, σ2
 end
-
-# function forward(bglr::BasicGaussianLinearRegression, X::M, train::Bool) where
-#         {M<:AbstractMatrix{<:Real}}
-
-# end
 
 
 # TODO: Each layer should be it's own type to allow for different numbers of
