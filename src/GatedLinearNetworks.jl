@@ -27,20 +27,19 @@ end
 """
 x is [data_dim, batch_dim]
 """
-function apply(layer::NormalizationLayer, x::AbstractMatrix)
-    for j in 1:size(x, 2)
-        layer.count .+= 1
-        xj = x[:,j]
-        delta = xj - layer.mean
-        layer.mean .+= delta ./ layer.count
-        delta2 = xj - layer.mean
-        layer.m2 .+= delta .* delta2
+function forward(layer::NormalizationLayer, x::AbstractMatrix, training::Bool)
+    if training
+        for j in 1:size(x, 2)
+            layer.count .+= 1
+            xj = x[:,j]
+            delta = xj - layer.mean
+            layer.mean .+= delta ./ layer.count
+            delta2 = xj - layer.mean
+            layer.m2 .+= delta .* delta2
+        end
     end
 
     @assert layer.count[1] > 0
-
-    @show layer.m2
-    @show layer.count
 
     sd = sqrt.(layer.m2 ./ layer.count)
     return (x .- layer.mean) ./ sd
@@ -55,10 +54,65 @@ end
 abstract type GaussianWeakLearner end
 
 
-struct BasicGaussianLinearRegression <: GaussianWeakLearner
+struct BasicGaussianLinearRegression{
+        VF <: AbstractVector{<:Real},
+        VI <: AbstractVector{Int}} <: GaussianWeakLearner
+    i::Int
 
+    # accumulated sufficient statistics
+    xy::VF # [prediction_dim]
+    xx::VF # [1]
+    y::VF # [prediction_dim]
+    count::VI # [1]
+
+    # known prior precision
+    τ0::VF # [prediction_dim]
+    τ::VF # [prediction_dim]
 end
 
+
+function BasicGaussianLinearRegression(i::Int, prediction_dim::Int)
+    return BasicGaussianLinearRegression(
+        i,
+        zeros(Float32, prediction_dim),
+        zeros(Float32, 1),
+        zeros(Float32, prediction_dim),
+        zeros(Int, 1),
+        fill(1f0, prediction_dim),
+        fill(1f0, prediction_dim))
+end
+
+
+function forward(
+        layer::BasicGaussianLinearRegression,
+        x::AbstractMatrix, y::AbstractMatrix, training::Bool)
+
+    τ_w = layer.τ0 .+ layer.τ .* layer.xx
+    μ_w = layer.τ .* inv.(τ_w) .* layer.xy
+
+    τ_b = layer.τ0 .+ layer.τ .* layer.count
+    μ_b = layer.τ .* inv.(τ_b) .* layer.y
+
+    xi = x[layer.i,:]
+
+    μ = xi .* μ_w .+ μ_b
+    σ = inv.(layer.τ) .+ inv.(τ_b) .+ xi.^2 .* inv.(τ_w)
+
+    if training
+        for j in 1:size(x, 2)
+            xij = x[layer.i,j]
+            yj = y[:,j]
+
+            layer.xx .+= xij^2
+            layer.xy .+= xij*yj
+            layer.y .+= yj
+            layer.count .+= 1
+        end
+    end
+
+    # [predicton_dim, batch_dim]
+    return μ, σ.^2
+end
 
 # function forward(bglr::BasicGaussianLinearRegression, X::M, train::Bool) where
 #         {M<:AbstractMatrix{<:Real}}
