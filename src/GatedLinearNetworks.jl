@@ -62,12 +62,11 @@ abstract type GaussianWeakLearner end
 
 struct BasicGaussianLinearRegression{
         VF <: AbstractVector{<:Real},
+        MF <: AbstractMatrix{<:Real},
         VI <: AbstractVector{Int}} <: GaussianWeakLearner
-    i::Int
-
     # accumulated sufficient statistics
-    xy::VF # [prediction_dim]
-    xx::VF # [1]
+    xy::MF # [predictor_dim, prediction_dim]
+    xx::VF # [predictor_dim]
     x::VF # [prediction_dim]
     y::VF # [prediction_dim]
     count::VI # [1]
@@ -78,71 +77,83 @@ struct BasicGaussianLinearRegression{
 end
 
 
-function BasicGaussianLinearRegression(i::Int, prediction_dim::Int)
+function BasicGaussianLinearRegression(predictor_dim::Int, prediction_dim::Int)
     return BasicGaussianLinearRegression(
-        i,
-        zeros(Float32, prediction_dim),
-        zeros(Float32, 1),
-        zeros(Float32, 1),
+        zeros(Float32, (predictor_dim, prediction_dim)),
+        zeros(Float32, predictor_dim),
+        zeros(Float32, predictor_dim),
         zeros(Float32, prediction_dim),
         zeros(Int, 1),
-        fill(1f0, prediction_dim),
-        fill(1f0, prediction_dim))
+        Float32[1f0],
+        Float32[1f0])
 end
 
-# TODO: Ok, can I batch this?
 
 function forward(
         layer::BasicGaussianLinearRegression,
         x::AbstractMatrix, y::AbstractMatrix, training::Bool)
 
-    xi = x[layer.i,:]
+    predictor_dim = size(x, 1)
+    prediction_dim = size(y, 1)
+    batch_dim = size(x, 2)
 
-    c = (layer.τ0 .+ layer.τ .* layer.count) .*
+    # [predictor_dim]
+    c1 = (layer.τ0 .+ layer.τ .* layer.count) .*
         (layer.τ0 .+ layer.τ .* layer.xx) .- (layer.τ .* layer.x).^2
 
-    v = layer.τ .* layer.x .* layer.y
+    # [predictor_dim]
+    c2 = layer.τ ./ c1
 
-    μ_w = (layer.τ ./ c) .*
-        ((layer.τ0 .+ layer.τ .* layer.count) .* layer.xy .-
-        layer.τ .* layer.x .* layer.y)
+    # [predictor_dim, prediction_dim]
+    uw = (layer.τ0 .+ layer.τ .* layer.count) .* layer.xy
 
+    vw = layer.τ .* reshape(layer.x, (predictor_dim, 1)) .*
+        reshape(layer.y, (1, prediction_dim))
 
-    μ_b = (layer.τ ./ c) .*
-        ((layer.τ0 .+ layer.τ .* layer.xx) .* layer.y .-
-        layer.τ .* layer.x .* layer.xy)
+    # [predictor_dim, prediction_dim]
+    μ_w = c2 .* (uw .- vw)
 
-    σ2 = inv.(layer.τ) .+ inv.(c) .* (
-        (layer.τ0 .+ layer.τ .* layer.count) .* xi.^2 .-
-        layer.τ .* xi .* layer.x .+
+    # [predictor_dim, prediction_dim]
+    ub = (layer.τ0 .+ layer.τ .* reshape(layer.xx, (predictor_dim, 1))) .*
+        reshape(layer.y, (1, prediction_dim))
+
+    vb = layer.τ .* layer.x .* layer.xy
+
+    # [predictor_dim, predction_dim]
+    μ_b = c2 .* (ub .- vb)
+
+    # [predictors_dim, batch_dim]
+    σ2 = inv.(layer.τ) .+ inv.(c1) .* (
+        (layer.τ0 .+ layer.τ .* layer.count) .* x.^2 .-
+        2f0 .* layer.τ .* x .* layer.x .+
         layer.τ0 .+
-        layer.τ .* layer.xx .-
-        layer.τ .* xi .* layer.x)
+        layer.τ .* layer.xx)
 
-    μ = xi .* μ_w .+ μ_b
+    # repeat this across the prediction_dim, since this is an isotropic gaussian
+
+    # [predictior_dim, prediction_dim, batch_dim]
+    σ2 = repeat(reshape(σ2, (predictor_dim, 1, batch_dim)), 1, prediction_dim, 1)
+
+    # [predictors_dim, predictions_dim, batch_dim]
+    μ = reshape(x, (predictor_dim, 1, batch_dim)) .*
+        reshape(μ_w, (predictor_dim, prediction_dim, 1)) .+
+        reshape(μ_b, (predictor_dim, prediction_dim, 1))
 
     if training
-        for j in 1:size(x, 2)
-            xij = x[layer.i,j]
-            yj = y[:,j]
+        layer.xx .+= dropdims(sum(x.*x, dims=2), dims=2)
+        layer.xy .+=
+            dropdims(sum(reshape(x, (predictor_dim, 1, batch_dim)) .*
+            reshape(y, (1, prediction_dim, batch_dim)), dims=3), dims=3)
 
-            layer.x .+= xij
-            layer.xx .+= xij^2
-            layer.xy .+= xij*yj
-            layer.y .+= yj
-            layer.count .+= 1
-        end
+        layer.x .+= dropdims(sum(x, dims=2), dims=2)
+        layer.y .+= dropdims(sum(y, dims=2), dims=2)
+        layer.count .+= size(x, 2)
     end
 
-    # [predicton_dim, batch_dim]
+    # [predictor_dim, predicton_dim, batch_dim]
     return μ, σ2
 end
 
-
-# TODO: Each layer should be it's own type to allow for different numbers of
-# neurons.
-
-# Should each neuron be a separate type?
 
 struct GGLNLayer{
         MF <: AbstractMatrix{<:Real},
