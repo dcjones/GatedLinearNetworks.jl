@@ -1,5 +1,7 @@
 module GatedLinearNetworks
 
+export GaussianGGLN, train!, predict
+
 using Flux
 using Statistics
 
@@ -25,6 +27,9 @@ end
 
 
 """
+Apply standardization to the input, and update parameters if `training` is true.
+This is basically batch normalization.
+
 x is [data_dim, batch_dim]
 """
 function forward(layer::NormalizationLayer, x::AbstractMatrix, training::Bool)
@@ -64,6 +69,10 @@ end
 abstract type GaussianWeakLearner end
 
 
+"""
+Bayesian gaussian linear regression with known precision. Used as a weak
+learner input to the GGLN.
+"""
 struct BasicGaussianLinearRegression{
         VF <: AbstractVector{<:Real},
         MF <: AbstractMatrix{<:Real},
@@ -81,6 +90,12 @@ struct BasicGaussianLinearRegression{
 end
 
 
+"""
+Construct a bayesian linear regression.
+
+  * `predictor_dim`: dimensionality of predictors
+  * `prediction_dim`: dimensionality of predictions
+"""
 function BasicGaussianLinearRegression(predictor_dim::Int, prediction_dim::Int)
     return BasicGaussianLinearRegression(
         zeros(Float32, (predictor_dim, prediction_dim)),
@@ -93,6 +108,10 @@ function BasicGaussianLinearRegression(predictor_dim::Int, prediction_dim::Int)
 end
 
 
+"""
+Forward pass for the linear regression. Train when `y` is given, otherwise
+only output posterior predictive parameters.
+"""
 function forward(
         layer::BasicGaussianLinearRegression,
         x::AbstractMatrix, y::Union{Nothing, AbstractMatrix})
@@ -163,6 +182,9 @@ function forward(
 end
 
 
+"""
+A single GGLN layer with arbitrary number of units.
+"""
 struct GGLNLayer{
         MF <: AbstractMatrix{<:Real},
         VF <: AbstractVector{<:Real},
@@ -188,6 +210,16 @@ struct GGLNLayer{
 end
 
 
+"""
+Construct a single GGLN layer.
+
+  * `input_dim`: number of inputs (i.e. number of units in the prev layer)
+  * `output_dim`: number of outputs (i.e. number of units in this layer)
+  * `contexn_dim`: number of context functions (inducing 2^context_dim weight vectors)
+  * `predictor_dim`: dimensionality of predictors
+  * `prediction_dim`: dimensionality of predictions
+  * `learning_rate`: controls step size
+"""
 function GGLNLayer(
         input_dim::Int, output_dim::Int,
         context_dim::Int, predictor_dim::Int, prediction_dim::Int,
@@ -230,6 +262,7 @@ end
 
 
 """
+Forward pass for a single GGLN layer, training if `y` is given, predicting if not.
 
 input_μ: [input_dim, prediction_dim, batch_dim]
 input_σ2: [input_dim, prediction_dim, batch_dim]
@@ -292,6 +325,9 @@ function forward(
 end
 
 
+"""
+Complete GGLN model.
+"""
 struct GaussianGGLN{AF <: AbstractArray{<:Real,3}}
     x_norm::NormalizationLayer
     y_norm::NormalizationLayer
@@ -304,6 +340,16 @@ struct GaussianGGLN{AF <: AbstractArray{<:Real,3}}
 end
 
 
+"""
+Construct an untrained gaussian gated linear network.
+
+  * `predictor_dim`: dimensionality of predictors (x)
+  * `prediction_dim`: dimensionality of predictions (y)
+  * `num_layers`: number of layers in the model
+  * `layer_width`: width of each layer in the model
+  * `context_dim`: number of context functions (inducing 2^context_dim weight vectors)
+  * `bias`: values for `bias` units.
+"""
 function GaussianGGLN(
         predictor_dim::Int, prediction_dim::Int,
         num_layers::Int, layer_width::Int, context_dim::Int,
@@ -346,6 +392,9 @@ function GaussianGGLN(
 end
 
 
+"""
+Forward pass for the GGLN, training if y is given, predicting otherwise.
+"""
 function forward(ggln::GaussianGGLN, x::AbstractMatrix, y::Union{Nothing, AbstractMatrix})
 
     batch_dim = size(x, 2)
@@ -372,5 +421,28 @@ function forward(ggln::GaussianGGLN, x::AbstractMatrix, y::Union{Nothing, Abstra
         dropdims(mean(μ, dims=1), dims=1),
         dropdims(mean(σ2, dims=1), dims=1))
 end
+
+
+"""
+Train the model one step using a the batch of predictors `x` and predictions
+`y`.
+
+`x` should have shape [predictors dimension, batch size]
+`y` should have shape [predictions dimension, batch size]
+"""
+function train!(ggln::GaussianGGLN, x::AbstractMatrix, y::AbstractMatrix)
+    return forward(ggln, x, y)
+end
+
+
+"""
+Make predictions using a trained model for predictors `x`.
+
+`x` should have shape [predictors dimension, batch size]
+"""
+function predict(ggln::GaussianGGLN, x::AbstractMatrix)
+    return forward(ggln, x, nothing)
+end
+
 
 end # module
