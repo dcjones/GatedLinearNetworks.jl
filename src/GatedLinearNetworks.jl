@@ -3,6 +3,71 @@ module GatedLinearNetworks
 using Flux
 using Statistics
 
+struct GaussianGGLN{AF <: AbtractArray{3,:Real}}
+    x_norm::NormalizationLayer
+    y_norm::NormalizationLayer
+    weak_learner::BasicGaussianLinearRegression
+    layers::Vector{GGLNLayer}
+
+    # [bias_dim, prediction_dim, 1]
+    μ_bias::AF
+    σ2_bias::AF
+end
+
+
+function GaussianGGLN(
+        predictor_dim::Int, prediction_dim::Int,
+        num_layers::Int, layer_width::Int, context_dim::Int,
+        bias::Float32=5.0f0)
+
+    layers = GGLNLayer[]
+    push!(
+        layers, GGLNLayer(
+            predictor_dim, layer_width, context_dim,
+            predictor_dim, prediction_dim))
+
+    for i in 1:num_layers-1
+        push!(
+            layers, GGLNLayer(
+                layer_width, layer_width, context_dim,
+                predictor_dim, prediction_dim))
+    end
+
+    # compute the bias arrays
+    bias_dim = 2^prediction_dim
+    μ_bias = Array{Float32}(undef, (bias_dim, prediction_dim, 1))
+
+    # I want a bias μ at every corner of the hypercube [-bias, bias]^prediction_dim
+    for i in 1:bias_dim, j in 1:prediction_dim
+        μ_bias[i, j, 1] = bias * (-1)^((i-1) & (1 << j-1))
+    end
+    σ2_bias = ones(Float32,  (bias_dim, prediction_dim, 1))
+
+    return GaussianGGLN(
+        NormalizationLayer(predictor_dim),
+        NormalizationLayer(prediction_dim),
+        BasicGaussianLinearRegression(predictor_dim, prediction_dim),
+        layers, μ_bias, σ2_bias)
+end
+
+
+function forward(ggln::GaussianGGLN, x::AbstractMatrix, y::Union{Nothing, AbstractMatrix})
+    xz = forward(ggln.norm, x, y !== nothing)
+    yz = y === nothing ? nothing : forward(ggln.norm, y, true)
+
+    μ, σ2 = forward(ggls.weaklearner, xz, yz)
+
+    for layer in layers
+        # [output_dim, prediction_dim, batch_dim]
+        μ, σ2 = forward(layer, μ, σ2, xz, yz)
+
+        # concatenate bias inputs
+        μ = cat(repeat(ggln.μ_bias, 1, 1, batch_dim), μ, dims=1)
+        σ2 = cat(repeat(ggln.σ2_bias, 1, 1, batch_dim), σ2, dims=1)
+    end
+
+    return μ, σ2
+end
 
 
 """
@@ -52,11 +117,6 @@ function inverse(layer::NormalizationLayer, z::AbstractMatrix)
 end
 
 
-# TODO: implement simplistic online gaussian linear regression.
-
-# What's the idea here? We need to produce multiple regression models? Each
-# is fit using a supset of the points, or a subset of the dimensions?
-
 abstract type GaussianWeakLearner end
 
 
@@ -91,7 +151,7 @@ end
 
 function forward(
         layer::BasicGaussianLinearRegression,
-        x::AbstractMatrix, y::AbstractMatrix, training::Bool)
+        x::AbstractMatrix, y::Union{Nothing, AbstractMatrix})
 
     predictor_dim = size(x, 1)
     prediction_dim = size(y, 1)
@@ -139,7 +199,7 @@ function forward(
         reshape(μ_w, (predictor_dim, prediction_dim, 1)) .+
         reshape(μ_b, (predictor_dim, prediction_dim, 1))
 
-    if training
+    if y !== nothing
         layer.xx .+= dropdims(sum(x.*x, dims=2), dims=2)
         layer.xy .+=
             dropdims(sum(reshape(x, (predictor_dim, 1, batch_dim)) .*
@@ -230,9 +290,9 @@ input_σ2: [input_dim, prediction_dim, batch_dim]
 z: [predictor_dim, batch_dim]
 y: [prediction_dim, batch_dim]
 """
-function apply(
+function forward(
         layer::GGLNLayer, input_μ::AbstractArray, input_σ2::AbstractArray,
-        z::AbstractMatrix, y::AbstractMatrix, training::Bool)
+        z::AbstractMatrix, y::Union{Nothing, AbstractMatrix})
 
     # input_μ, input_σ should be [input_dim, batch_dim]
     batch_dim = size(input_μ, 3)
@@ -260,21 +320,21 @@ function apply(
         return μ, σ2
     end
 
-    function loss(weights)
-        # [output_dim, prediction_dim, batch_dim]
-        μ, σ2 = predict(weights)
-        σ = sqrt.(σ2)
+    if y !== nothing
+        function loss(weights)
+            # [output_dim, prediction_dim, batch_dim]
+            μ, σ2 = predict(weights)
+            σ = sqrt.(σ2)
 
-        @show size(μ)
-        @show size(y)
+            @show size(μ)
+            @show size(y)
 
-        y_ = reshape(y, (1, layer.prediction_dim, batch_dim))
+            y_ = reshape(y, (1, layer.prediction_dim, batch_dim))
 
-        # negative normal log-pdf
-        return -sum(.- log.(σ) .- 0.5 * log.(2*π) .- 0.5 .* ((y_ .- μ) ./ σ).^2)
-    end
+            # negative normal log-pdf
+            return -sum(.- log.(σ) .- 0.5 * log.(2*π) .- 0.5 .* ((y_ .- μ) ./ σ).^2)
+        end
 
-    if training
         dloss_dweights = gradient(loss, weights)[1]
         layer.weights[:,cs] = weights - layer.learning_rate * dloss_dweights
         # TODO: paper says we have to project here to keep weights within
