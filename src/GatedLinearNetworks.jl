@@ -3,71 +3,6 @@ module GatedLinearNetworks
 using Flux
 using Statistics
 
-struct GaussianGGLN{AF <: AbtractArray{3,:Real}}
-    x_norm::NormalizationLayer
-    y_norm::NormalizationLayer
-    weak_learner::BasicGaussianLinearRegression
-    layers::Vector{GGLNLayer}
-
-    # [bias_dim, prediction_dim, 1]
-    μ_bias::AF
-    σ2_bias::AF
-end
-
-
-function GaussianGGLN(
-        predictor_dim::Int, prediction_dim::Int,
-        num_layers::Int, layer_width::Int, context_dim::Int,
-        bias::Float32=5.0f0)
-
-    layers = GGLNLayer[]
-    push!(
-        layers, GGLNLayer(
-            predictor_dim, layer_width, context_dim,
-            predictor_dim, prediction_dim))
-
-    for i in 1:num_layers-1
-        push!(
-            layers, GGLNLayer(
-                layer_width, layer_width, context_dim,
-                predictor_dim, prediction_dim))
-    end
-
-    # compute the bias arrays
-    bias_dim = 2^prediction_dim
-    μ_bias = Array{Float32}(undef, (bias_dim, prediction_dim, 1))
-
-    # I want a bias μ at every corner of the hypercube [-bias, bias]^prediction_dim
-    for i in 1:bias_dim, j in 1:prediction_dim
-        μ_bias[i, j, 1] = bias * (-1)^((i-1) & (1 << j-1))
-    end
-    σ2_bias = ones(Float32,  (bias_dim, prediction_dim, 1))
-
-    return GaussianGGLN(
-        NormalizationLayer(predictor_dim),
-        NormalizationLayer(prediction_dim),
-        BasicGaussianLinearRegression(predictor_dim, prediction_dim),
-        layers, μ_bias, σ2_bias)
-end
-
-
-function forward(ggln::GaussianGGLN, x::AbstractMatrix, y::Union{Nothing, AbstractMatrix})
-    xz = forward(ggln.norm, x, y !== nothing)
-    yz = y === nothing ? nothing : forward(ggln.norm, y, true)
-
-    μ, σ2 = forward(ggls.weaklearner, xz, yz)
-
-    for layer in layers
-        # [output_dim, prediction_dim, batch_dim]
-        μ, σ2 = forward(layer, μ, σ2, xz, yz)
-
-        # concatenate bias inputs
-        μ = cat(repeat(ggln.μ_bias, 1, 1, batch_dim), μ, dims=1)
-        σ2 = cat(repeat(ggln.σ2_bias, 1, 1, batch_dim), σ2, dims=1)
-    end
-
-    return μ, σ2
-end
 
 
 """
@@ -111,9 +46,18 @@ function forward(layer::NormalizationLayer, x::AbstractMatrix, training::Bool)
 end
 
 
-function inverse(layer::NormalizationLayer, z::AbstractMatrix)
+function inverse(layer::NormalizationLayer, z::AbstractArray)
     sd = sqrt.(layer.m2 ./ layer.count)
     return (z .* sd) .+ layer.mean
+end
+
+function inverse(layer::NormalizationLayer, μ::AbstractArray, σ2::AbstractArray)
+    sd = sqrt.(layer.m2 ./ layer.count)
+
+    μ_inv = (μ .* sd) .+ layer.mean
+    σ2_inv = σ2 .* sd.^2
+
+    return μ_inv, σ2_inv
 end
 
 
@@ -252,7 +196,8 @@ function GGLNLayer(
 
     # TODO:
     # How do I initialize weights? They are in some hypercube, right?
-    weights = exp.(randn(Float32, (input_dim, output_dim*(2^context_dim))))
+    # weights = exp.(randn(Float32, (input_dim, output_dim*(2^context_dim))))
+    weights = fill(1f0/input_dim, (input_dim, output_dim*(2^context_dim)))
 
     return GGLNLayer(
         input_dim,
@@ -294,18 +239,22 @@ function forward(
         layer::GGLNLayer, input_μ::AbstractArray, input_σ2::AbstractArray,
         z::AbstractMatrix, y::Union{Nothing, AbstractMatrix})
 
+    @show size(input_μ)
+
     # input_μ, input_σ should be [input_dim, batch_dim]
     batch_dim = size(input_μ, 3)
 
     # [output_dim, batch_dim]
     cs = context_functions(layer, z)
 
-    # [input_dim, output_dim, 1, batch_dim]
-    weights = layer.weights[:,cs]
+    @show cs
 
     function predict(weights)
+        # [input_dim, output_dim, 1, batch_dim]
+        weights_cs = weights[:,cs]
+
         weights_ = reshape(
-            weights, (layer.input_dim, layer.output_dim, 1, batch_dim))
+            weights_cs, (layer.input_dim, layer.output_dim, 1, batch_dim))
 
         # [input_dim, 1, prediction_dim, batch_dim]
         input_μ_ = reshape(input_μ, (layer.input_dim, 1, layer.prediction_dim, batch_dim))
@@ -326,23 +275,111 @@ function forward(
             μ, σ2 = predict(weights)
             σ = sqrt.(σ2)
 
-            @show size(μ)
-            @show size(y)
-
             y_ = reshape(y, (1, layer.prediction_dim, batch_dim))
 
             # negative normal log-pdf
             return -sum(.- log.(σ) .- 0.5 * log.(2*π) .- 0.5 .* ((y_ .- μ) ./ σ).^2)
         end
 
-        dloss_dweights = gradient(loss, weights)[1]
-        layer.weights[:,cs] = weights - layer.learning_rate * dloss_dweights
+        dloss_dweights = gradient(loss, layer.weights)[1]
+        @show dloss_dweights
+        @show size(dloss_dweights)
+        # @show dloss_dweights
+        # layer.weights[:,cs] = weights - layer.learning_rate * dloss_dweights
+        layer.weights .-= layer.learning_rate .* dloss_dweights
         # TODO: paper says we have to project here to keep weights within
         # a valid range. Their code doesn't seem to though.
+        #
+        # It seems what the actually do is just add some sort
+        # of penalty to the loss function.
     end
 
-    return predict(weights)
+    @show layer.weights
+
+    return predict(layer.weights)
 end
 
+
+struct GaussianGGLN{AF <: AbstractArray{<:Real,3}}
+    x_norm::NormalizationLayer
+    y_norm::NormalizationLayer
+    weak_learner::BasicGaussianLinearRegression
+    layers::Vector{GGLNLayer}
+
+    # [bias_dim, prediction_dim, 1]
+    μ_bias::AF
+    σ2_bias::AF
+end
+
+
+function GaussianGGLN(
+        predictor_dim::Int, prediction_dim::Int,
+        num_layers::Int, layer_width::Int, context_dim::Int,
+        bias::Float32=5.0f0)
+
+    bias_dim = 2*prediction_dim
+
+    layers = GGLNLayer[]
+
+    if num_layers > 0
+        push!(
+            layers, GGLNLayer(
+                predictor_dim + bias_dim, layer_width, context_dim,
+                predictor_dim, prediction_dim))
+    end
+
+    for i in 1:num_layers-1
+        push!(
+            layers, GGLNLayer(
+                layer_width + bias_dim, layer_width, context_dim,
+                predictor_dim, prediction_dim))
+    end
+
+    # compute the bias arrays
+    μ_bias = Array{Float32}(undef, (bias_dim, prediction_dim, 1))
+    μ_bias = zeros(Float32, (bias_dim, prediction_dim, 1))
+
+    # We want a bias unit for +/- bias for every prediction dimension.
+    for i in 1:prediction_dim
+        μ_bias[i, i, 1] = -bias
+    end
+    for i in 1:prediction_dim
+        μ_bias[2*(i-1)+1, i, 1] = bias
+    end
+    σ2_bias = ones(Float32,  (bias_dim, prediction_dim, 1))
+
+    return GaussianGGLN(
+        NormalizationLayer(predictor_dim),
+        NormalizationLayer(prediction_dim),
+        BasicGaussianLinearRegression(predictor_dim, prediction_dim),
+        layers, μ_bias, σ2_bias)
+end
+
+
+function forward(ggln::GaussianGGLN, x::AbstractMatrix, y::Union{Nothing, AbstractMatrix})
+
+    batch_dim = size(x, 2)
+
+    @assert size(x, 2) == size(y, 2)
+    @assert size(y, 1) == size(ggln.μ_bias, 2)
+
+    xz = forward(ggln.x_norm, x, y !== nothing)
+    yz = y === nothing ? nothing : forward(ggln.y_norm, y, true)
+
+    μ, σ2 = forward(ggln.weak_learner, xz, yz)
+
+    for layer in ggln.layers
+        # concatenate bias inputs
+        μ = cat(repeat(ggln.μ_bias, 1, 1, batch_dim), μ, dims=1)
+        σ2 = cat(repeat(ggln.σ2_bias, 1, 1, batch_dim), σ2, dims=1)
+
+        # [output_dim, prediction_dim, batch_dim]
+        μ, σ2 = forward(layer, μ, σ2, xz, yz)
+    end
+
+    return inverse(ggln.y_norm, μ, σ2)
+
+    return μ, σ2
+end
 
 end # module
