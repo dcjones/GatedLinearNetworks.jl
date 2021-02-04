@@ -183,6 +183,60 @@ end
 
 
 """
+Basically MinHash.
+"""
+struct LocalitySensitiveHash{
+        MF <: AbstractMatrix{<:Real},
+        VF <: AbstractVector{<:Real},
+        VI <: AbstractVector{Int32}}
+
+    output_dim::Int
+    context_dim::Int
+
+    # context function parameters
+    hyperplanes::MF
+    hyperplanes_bias::VF
+
+    # used to compute weight indexes
+    bit_offsets::VI
+    k_offsets::VI
+end
+
+
+"""
+Construct a locality sensitive hash function.
+
+  * `output_dim`: number of outputs (i.e. number of units in this layer)
+  * `context_dim`: number of context functions (inducing 2^context_dim weight vectors)
+  * `predictor_dim`: dimensionality of predictors
+"""
+function LocalitySensitiveHash(output_dim::Int, context_dim::Int, predictor_dim::Int)
+    hyperplanes = randn(Float32, (output_dim*context_dim, predictor_dim))
+    hyperplanes_bias = randn(Float32, (output_dim*context_dim))
+
+    bit_offsets = collect(Int32, 0:context_dim-1)
+    k_offsets = collect(Int32, 1:output_dim)
+
+    return LocalitySensitiveHash(
+        output_dim, context_dim, hyperplanes, hyperplanes_bias, bit_offsets, k_offsets)
+end
+
+
+"""
+Apply the context functions for this layer, mapping (standardized) input vectors
+to indexes in [1, 2^context_dim].
+"""
+function (lsh::LocalitySensitiveHash)(X::AbstractMatrix)
+    bits = (lsh.hyperplanes * X) .> lsh.hyperplanes_bias
+    batch_dim = size(X, 2)
+    bits_reshape = reshape(bits, (lsh.context_dim, lsh.output_dim, batch_dim))
+    cs = dropdims(sum(bits_reshape .<< lsh.bit_offsets, dims=1), dims=1) .+ lsh.k_offsets
+
+    return cs
+end
+
+
+"""
 A single GGLN layer with arbitrary number of units.
 """
 struct GGLNLayer{
@@ -198,13 +252,7 @@ struct GGLNLayer{
 
     learning_rate::Float64
 
-    # context function parameters
-    hyperplanes::MF
-    hyperplanes_bias::VF
-
-    # used to compute weight indexes
-    bit_offsets::VI
-    k_offsets::VI
+    lsh::LocalitySensitiveHash{MF, VF, VI}
 
     weights::MF
 end
@@ -215,7 +263,7 @@ Construct a single GGLN layer.
 
   * `input_dim`: number of inputs (i.e. number of units in the prev layer)
   * `output_dim`: number of outputs (i.e. number of units in this layer)
-  * `contexn_dim`: number of context functions (inducing 2^context_dim weight vectors)
+  * `context_dim`: number of context functions (inducing 2^context_dim weight vectors)
   * `predictor_dim`: dimensionality of predictors
   * `prediction_dim`: dimensionality of predictions
   * `learning_rate`: controls step size
@@ -224,12 +272,8 @@ function GGLNLayer(
         input_dim::Int, output_dim::Int,
         context_dim::Int, predictor_dim::Int, prediction_dim::Int,
         learning_rate::Float64=1e-2)
-    hyperplanes = randn(Float32, (output_dim*context_dim, predictor_dim))
-    hyperplanes_bias = randn(Float32, (output_dim*context_dim))
 
-    bit_offsets = collect(Int32, 0:context_dim-1)
-    k_offsets = collect(Int32, 1:output_dim)
-
+    lsh = LocalitySensitiveHash(output_dim, context_dim, predictor_dim)
     weights = fill(log(1f0/input_dim), (input_dim, output_dim*(2^context_dim)))
 
     return GGLNLayer(
@@ -239,25 +283,8 @@ function GGLNLayer(
         predictor_dim,
         prediction_dim,
         learning_rate,
-        hyperplanes,
-        hyperplanes_bias,
-        bit_offsets,
-        k_offsets,
+        lsh,
         weights)
-end
-
-
-"""
-Apply the context functions for this layer, mapping (standardized) input vectors
-to indexes in [1, 2^context_dim].
-"""
-function context_functions(layer::GGLNLayer, X::AbstractMatrix)
-    bits = (layer.hyperplanes * X) .> layer.hyperplanes_bias
-    batch_dim = size(X, 2)
-    bits_reshape = reshape(bits, (layer.context_dim, layer.output_dim, batch_dim))
-    cs = dropdims(sum(bits_reshape .<< layer.bit_offsets, dims=1), dims=1) .+ layer.k_offsets
-
-    return cs
 end
 
 
@@ -277,7 +304,7 @@ function forward(
     batch_dim = size(input_μ, 3)
 
     # [output_dim, batch_dim]
-    cs = context_functions(layer, z)
+    cs = layer.lsh(z)
 
     function predict(weights)
         # [input_dim, output_dim, 1, batch_dim]
